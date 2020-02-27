@@ -32,7 +32,7 @@ struct global {
   bool writers;
   bool random;
   void * file_mem;
-  void * shared_mem;
+  char * shared_mem;
 } global;
 
 long PG_SIZE = 0;
@@ -75,6 +75,7 @@ void * gpu_file_malloc(char * file_name, size_t allocation_size) {
   assert(allocation_size % global.PG_SIZE == 0);
 
   void * file_mem = file_mmap(file_name, allocation_size);
+  global.file_mem = file_mem;
   void * dev_ptr = NULL;
 
   CUDA_CALL(cudaMalloc(&dev_ptr, allocation_size));
@@ -165,6 +166,20 @@ void launch_bench(char * buffer,
     }
 }
 
+__host__
+void update_file_from_gpu() {
+  switch (global.allocation_type) {
+    case _MALLOC:
+      CUDA_CALL(cudaMemcpy(global.file_mem, 
+                           global.shared_mem,
+                           global.file_size,
+                           cudaMemcpyDeviceToHost));
+    case _MMAP:
+    case _MALLOC_MANAGED:
+      break;
+  }
+}
+
 /* Initialize random number generators for each thread */
 __global__
 void random_init(curandState_t * rand_state_arr) {
@@ -184,7 +199,6 @@ void random_init(curandState_t * rand_state_arr) {
    */
 int main(int argc, char ** argv) {
   assert(argc == 9);
-  DEBUG_PRINT("Hello cuda\n");
 
   /* Parse args */
   global = {
@@ -202,7 +216,6 @@ int main(int argc, char ** argv) {
   };
   assert(global.file_size % global.PG_SIZE == 0);
   assert(global.file_size % global.NUM_THREADS * global.NUM_BLOCKS == 0);
-  printf("filename: %s\n", global.file_name);
 
 
   /* Setup file memory */
@@ -213,7 +226,7 @@ int main(int argc, char ** argv) {
   CUDA_CALL(cudaEventCreate(&end));
 
   CUDA_CALL(cudaEventRecord(start));
-  shared_mem = map_file_to_gpu();
+  global.shared_mem = map_file_to_gpu();
   CUDA_CALL(cudaEventRecord(end));
   CUDA_CALL(cudaEventSynchronize(end));
   CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
@@ -229,7 +242,7 @@ int main(int argc, char ** argv) {
   CUDA_CALL(cudaEventCreate(&start));
   CUDA_CALL(cudaEventCreate(&end));
   CUDA_CALL(cudaEventRecord(start));
-  launch_bench<<<global.NUM_BLOCKS, global.NUM_THREADS>>>(shared_mem, 
+  launch_bench<<<global.NUM_BLOCKS, global.NUM_THREADS>>>(global.shared_mem, 
                                             rand_state_arr,
                                             global.NUM_BLOCKS * global.NUM_THREADS,
                                             global.file_size, 
@@ -242,6 +255,16 @@ int main(int argc, char ** argv) {
   CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
 
   printf("Kernel time: %f\n", mili);
+
+  /* Copy data back to file from gpu if malloc */
+  CUDA_CALL(cudaEventCreate(&start));
+  CUDA_CALL(cudaEventCreate(&end));
+  CUDA_CALL(cudaEventRecord(start));
+  update_file_from_gpu();
+  CUDA_CALL(cudaEventRecord(end));
+  CUDA_CALL(cudaEventSynchronize(end));
+  CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
+  printf("Copyback time: %f\n", mili);
 
   CUDA_CALL(cudaDeviceSynchronize());
 }
