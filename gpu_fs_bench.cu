@@ -21,6 +21,19 @@
 
 #include "gpu_fs_bench.ch"
 
+struct global {
+  long PG_SIZE;
+  unsigned NUM_THREADS;
+  unsigned NUM_BLOCKS;
+  char * file_name;
+  size_t file_size;
+  unsigned allocation_type;
+  bool readers;
+  bool writers;
+  bool random;
+  void * file_mem;
+  void * shared_mem;
+} global;
 
 long PG_SIZE = 0;
 
@@ -33,7 +46,7 @@ void print_char_parallel(void * file_mem) {
 
 __host__
 void * file_mmap(char * file_name, size_t allocation_size) {
-  assert(allocation_size % PG_SIZE == 0);
+  assert(allocation_size % global.PG_SIZE == 0);
 
   int fd = open(file_name, O_RDWR | O_CREAT, 0666);
   void * file_mem = mmap(0, allocation_size, PROT_READ | PROT_WRITE,
@@ -47,39 +60,57 @@ void * file_mmap(char * file_name, size_t allocation_size) {
 
 __host__
 void * gpu_file_mmap(char * file_name, size_t allocation_size) {
-  assert(allocation_size % PG_SIZE == 0);
+  assert(allocation_size % global.PG_SIZE == 0);
 
   void * file_mem = file_mmap(file_name, allocation_size);
 
-  CUDA_CALL(cudaHostRegister(file_mem, PG_SIZE, cudaHostRegisterMapped));
+  // TODO change from PG_SIZE
+  CUDA_CALL(cudaHostRegister(file_mem, allocation_size, cudaHostRegisterMapped));
   
   return file_mem;
 }
 
 __host__
 void * gpu_file_malloc(char * file_name, size_t allocation_size) {
-  assert(allocation_size % PG_SIZE == 0);
+  assert(allocation_size % global.PG_SIZE == 0);
+
+  void * file_mem = file_mmap(file_name, allocation_size);
+  void * dev_ptr = NULL;
+
+  CUDA_CALL(cudaMalloc(&dev_ptr, allocation_size));
+  CUDA_CALL(cudaMemcpy(dev_ptr, file_mem, allocation_size, cudaMemcpyHostToDevice));
+
+  return dev_ptr;
+}
+
+__host__
+void * gpu_file_malloc_managed(char * file_name, size_t allocation_size) {
+  assert(allocation_size % global.PG_SIZE == 0);
 
   void * file_mem = file_mmap(file_name, allocation_size);
   void * unified_ptr = NULL;
 
-  CUDA_CALL(cudaMalloc(&unified_ptr, allocation_size));
+  CUDA_CALL(cudaMallocManaged(&unified_ptr, allocation_size, cudaMemAttachGlobal));
   memcpy(unified_ptr, file_mem, allocation_size);
 
   return unified_ptr;
 }
 
 __host__
-void * gpu_file_malloc_managed(char * file_name, size_t allocation_size) {
-  assert(allocation_size % PG_SIZE == 0);
-
-  void * file_mem = file_mmap(file_name, allocation_size);
-  void * dev_ptr = NULL;
-
-  CUDA_CALL(cudaMallocManaged(&dev_ptr, allocation_size));
-  CUDA_CALL(cudaMemcpy(dev_ptr, file_mem, allocation_size, cudaMemcpyHostToDevice));
-
-  return dev_ptr;
+char * map_file_to_gpu() {
+  char * shared_mem = NULL;
+  switch (global.allocation_type) {
+    case _MMAP:
+      shared_mem = (char *) gpu_file_mmap(global.file_name, global.file_size);
+      break;
+    case _MALLOC:
+      shared_mem = (char *) gpu_file_malloc(global.file_name, global.file_size);
+      break;
+    case _MALLOC_MANAGED:
+      shared_mem = (char *) gpu_file_malloc_managed(global.file_name, global.file_size);
+      break;
+  }
+  return shared_mem;
 }
 
 /* Run a memory access benchmark on a memory mapped file
@@ -106,20 +137,22 @@ void launch_bench(char * buffer,
     unsigned global_index = blockIdx.x * blockDim.x + threadIdx.x;
     unsigned bytes_per_thread = size / total_threads;
     unsigned min_index = bytes_per_thread * global_index;
-    //unsigned max_index = min_index + bytes_per_thread - 1;
+    unsigned max_index = min_index + bytes_per_thread - 1;
 
     curandState_t * rand_state = rand_state_arr + global_index;
 
     //printf("id %d:%d; Index range %d:%d\n", blockIdx.x, threadIdx.x, 
            //min_index, max_index);
 
+
     unsigned index_offset = 0;
-    for (int i = 0; i < bytes_per_thread; bytes_per_thread += granularity) { 
+    for (int i = 0; i < bytes_per_thread; i += granularity) { 
       if (random_access) {
         index_offset = curand(rand_state) % bytes_per_thread;
       } else { /* Sequential */
         index_offset = i;
       }
+      assert(index_offset + min_index <= max_index);
 
       volatile char tmp = 0;
       if (readers) {
@@ -136,14 +169,8 @@ void launch_bench(char * buffer,
 __global__
 void random_init(curandState_t * rand_state_arr) {
     unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
-    curand_init(0, 0, 0, (rand_state_arr + index));
+    curand_init(index, 0, 0, (rand_state_arr + index));
 }
-
-enum allocation_type {
-  _mmap = 0,
-  _malloc = 1,
-  _malloc_managed = 2
-};
 
 /* Usage ./gpu_fs.o file_size blocks threads allocation_type read write random 
    blocks - blocks to run
@@ -160,65 +187,61 @@ int main(int argc, char ** argv) {
   DEBUG_PRINT("Hello cuda\n");
 
   /* Parse args */
-  //unsigned NUM_BLOCKS = atoi(argv[1]);
-  //unsigned NUM_THREADS = atoi(argv[2]);
-  unsigned NUM_THREADS = 1;
-  unsigned NUM_BLOCKS = 1;
-  char * file_name = argv[3];
-  size_t file_size = atoi(argv[4]);
-  unsigned allocation_type = atoi(argv[5]);
-  bool read = atoi(argv[6]);
-  bool write = atoi(argv[7]);
-  bool random = atoi(argv[8]);
+  global = {
+    .PG_SIZE =         (long) sysconf(_SC_PAGE_SIZE),
+    .NUM_THREADS =     (unsigned) atoi(argv[1]),
+    .NUM_BLOCKS =      (unsigned) atoi(argv[2]),
+    .file_name =       (char *) argv[3],
+    .file_size =       (size_t) atoi(argv[4]),
+    .allocation_type = (unsigned) atoi(argv[5]),
+    .readers =         (bool) atoi(argv[6]),
+    .writers =         (bool) atoi(argv[7]),
+    .random =          (bool) atoi(argv[8]),
+    .file_mem =        NULL,
+    .shared_mem =      NULL
+  };
+  assert(global.file_size % global.PG_SIZE == 0);
+  assert(global.file_size % global.NUM_THREADS * global.NUM_BLOCKS == 0);
+  printf("filename: %s\n", global.file_name);
 
-  printf("filename: %s\n", file_name);
-
-  PG_SIZE = sysconf(_SC_PAGE_SIZE);
-  assert(file_size % PG_SIZE == 0);
 
   /* Setup file memory */
-  char * shared_mem = NULL;
-  //switch (allocation_type) {
-  //  case _mmap:
-  //    shared_mem = (char *) gpu_file_mmap(file_name, file_size);
-  //    break;
-  //  case _malloc:
-  //    shared_mem = (char *) gpu_file_malloc(file_name, file_size);
-  //    break;
-  //  case _malloc_managed:
-  //    shared_mem = (char *) gpu_file_malloc_managed(file_name, file_size);
-  //    break;
-  //}
-  shared_mem = (char *) gpu_file_mmap(file_name, file_size);
-  DEBUG_PRINT("Ptr: %p\n", shared_mem);
-
-  /* Setup random number generator */
-  curandState_t * rand_state_arr = NULL;
-  CUDA_CALL(cudaMalloc(&rand_state_arr, 
-                       sizeof(curandState_t) * (NUM_BLOCKS * NUM_THREADS)));
-  random_init<<<NUM_BLOCKS, NUM_THREADS>>>((curandState_t *) rand_state_arr);
-
   cudaEvent_t start, end;
+  float mili = 0;
+  char * shared_mem = NULL;
   CUDA_CALL(cudaEventCreate(&start));
   CUDA_CALL(cudaEventCreate(&end));
 
   CUDA_CALL(cudaEventRecord(start));
-  launch_bench<<<NUM_BLOCKS, NUM_THREADS>>>(shared_mem, 
+  shared_mem = map_file_to_gpu();
+  CUDA_CALL(cudaEventRecord(end));
+  CUDA_CALL(cudaEventSynchronize(end));
+  CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
+  printf("Memory init time: %f\n", mili);
+
+  /* Setup random number generator */
+  curandState_t * rand_state_arr = NULL;
+  size_t rand_state_size = sizeof(curandState_t) * (global.NUM_BLOCKS * global.NUM_THREADS);
+  CUDA_CALL(cudaMalloc(&rand_state_arr, rand_state_size));
+  random_init<<<global.NUM_BLOCKS, global.NUM_THREADS>>>((curandState_t *) rand_state_arr);
+
+  /* Run benchmark */
+  CUDA_CALL(cudaEventCreate(&start));
+  CUDA_CALL(cudaEventCreate(&end));
+  CUDA_CALL(cudaEventRecord(start));
+  launch_bench<<<global.NUM_BLOCKS, global.NUM_THREADS>>>(shared_mem, 
                                             rand_state_arr,
-                                            NUM_BLOCKS * NUM_THREADS,
-                                            file_size, 
+                                            global.NUM_BLOCKS * global.NUM_THREADS,
+                                            global.file_size, 
                                             1 /*granularity*/,
                                             random,
                                             read,
                                             write);
-  //CUDA_CALL(cudaEventRecord(end));
-  //cudaError_t err = cudaEventSynchronize(end);
-  //printf("cudaerr %x\n", err);
-  float mili = 0;
-  //CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
+  CUDA_CALL(cudaEventRecord(end));
+  CUDA_CALL(cudaEventSynchronize(end));
+  CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
 
   printf("Kernel time: %f\n", mili);
 
-  //__sync_bool_compare_and_swap(sharedMem, (int) 0, (int) 1);
   CUDA_CALL(cudaDeviceSynchronize());
 }

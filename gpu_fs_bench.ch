@@ -8,6 +8,10 @@
       printf("Error at %s:%d:Error:%d\n",__FILE__,__LINE__,x); \
       exit(EXIT_FAILURE);}} while(0)
 
+#define _MMAP           0
+#define _MALLOC         1
+#define _MALLOC_MANAGED 2
+
 __global__
 void print_char_parallel(void * file_mem);
 
