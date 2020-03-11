@@ -33,6 +33,9 @@ struct global {
   bool random;
   void * file_mem;
   char * shared_mem;
+  cudaMemoryAdvise advise;
+  int device;
+  int mmap_advise;
 } global;
 
 long PG_SIZE = 0;
@@ -55,6 +58,11 @@ void * file_mmap(char * file_name, size_t allocation_size) {
     perror("mmap error\n");
   }
 
+  // TODO add madvise
+  // madvise(file_mem, allocation_size, global.mmap_advice);
+  // MADV_RANDOM
+  // MADV_SEQUENTIAL
+
   return file_mem;
 }
 
@@ -64,7 +72,6 @@ void * gpu_file_mmap(char * file_name, size_t allocation_size) {
 
   void * file_mem = file_mmap(file_name, allocation_size);
 
-  // TODO change from PG_SIZE
   CUDA_CALL(cudaHostRegister(file_mem, allocation_size, cudaHostRegisterMapped));
   
   return file_mem;
@@ -102,15 +109,38 @@ char * map_file_to_gpu() {
   char * shared_mem = NULL;
   switch (global.allocation_type) {
     case _MMAP:
+      //fprintf(stderr, "MMAP\n");
       shared_mem = (char *) gpu_file_mmap(global.file_name, global.file_size);
       break;
     case _MALLOC:
+      //fprintf(stderr, "MALLOC\n");
       shared_mem = (char *) gpu_file_malloc(global.file_name, global.file_size);
       break;
     case _MALLOC_MANAGED:
+      //fprintf(stderr, "MALLOC_MANAGED\n");
       shared_mem = (char *) gpu_file_malloc_managed(global.file_name, global.file_size);
       break;
   }
+
+  if (global.advise) { //TODO add a flag for memadvise
+    assert(global.allocation_type != _MALLOC);
+    // #define cudaCpuDeviceId ((int)-1)
+
+    // cudaMemAdviseSetReadMostly
+    // cudaMemAdviseSetPreferredLocation
+    // cudaMemAdviseSetAccessedBy
+    int dev_id = 0;
+    CUDA_CALL(cudaGetDevice(&dev_id));
+    //printf("Mem %p:size:%d\n", shared_mem, global.file_size);
+    //printf("Advise %d:id:%d\n", global.advise, dev_id);
+    CUDA_CALL(cudaMemAdvise(shared_mem, global.file_size,
+                            global.advise, dev_id));
+    //void * tmp = NULL;
+    //CUDA_CALL(cudaMalloc(&tmp, 4));
+    //CUDA_CALL(cudaMallocManaged(&tmp, 4096, cudaMemAttachGlobal));
+    //CUDA_CALL(cudaMemAdvise(shared_mem, 4096, cudaMemAdviseSetReadMostly, dev_id));
+  }
+
   return shared_mem;
 }
 
@@ -198,13 +228,13 @@ void random_init(curandState_t * rand_state_arr) {
    random = random access?
    */
 int main(int argc, char ** argv) {
-  assert(argc == 9);
+  assert(argc == 12);
 
   /* Parse args */
   global = {
     .PG_SIZE =         (long) sysconf(_SC_PAGE_SIZE),
-    .NUM_THREADS =     (unsigned) atoi(argv[1]),
-    .NUM_BLOCKS =      (unsigned) atoi(argv[2]),
+    .NUM_THREADS =     1024,//(unsigned) atoi(argv[1]),
+    .NUM_BLOCKS =      32,//(unsigned) atoi(argv[2]),
     .file_name =       (char *) argv[3],
     .file_size =       (size_t) atoi(argv[4]),
     .allocation_type = (unsigned) atoi(argv[5]),
@@ -212,10 +242,21 @@ int main(int argc, char ** argv) {
     .writers =         (bool) atoi(argv[7]),
     .random =          (bool) atoi(argv[8]),
     .file_mem =        NULL,
-    .shared_mem =      NULL
+    .shared_mem =      NULL,
+    .advise =          (cudaMemoryAdvise) atoi(argv[9]), //XXX 0 means no advise
+    .device =          (int) atoi(argv[10]), //XXX only matters if advise is non 0
+    .mmap_advise =     (int) atoi(argv[11]), //XXX -1 no advice
   };
   assert(global.file_size % global.PG_SIZE == 0);
   assert(global.file_size % global.NUM_THREADS * global.NUM_BLOCKS == 0);
+
+  //int blockSize;   // The launch configurator returned block size
+  //int minGridSize; // The minimum grid size needed to achieve the
+  //                 // maximum occupancy for a full device launch
+  //int gridSize;    // The actual grid size needed, based on input size
+
+  //cudaOccupancyMaxPotentialBlockSize( &minGridSize, &blockSize,
+                                      //launch_bench, 0, 0);
 
 
   /* Setup file memory */
