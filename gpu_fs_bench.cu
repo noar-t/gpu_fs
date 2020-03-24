@@ -53,7 +53,8 @@ void * file_mmap(char * file_name, size_t allocation_size) {
 
   int fd = open(file_name, O_RDWR | O_CREAT, 0666);
   void * file_mem = mmap(0, allocation_size, PROT_READ | PROT_WRITE,
-                         MAP_SHARED, fd, 0);
+                         MAP_SHARED | MAP_POPULATE, fd, 0);
+                         //MAP_SHARED | MAP_LOCKED, fd, 0);
   if (file_mem == MAP_FAILED) {
     perror("mmap error\n");
   }
