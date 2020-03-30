@@ -25,6 +25,10 @@ struct global {
   long PG_SIZE;
   unsigned NUM_THREADS;
   unsigned NUM_BLOCKS;
+  unsigned TOTAL_THREADS;
+  unsigned NUM_PAGES;
+  unsigned PADDED_NUM_PAGES;
+  unsigned PAGES_PER_THREAD;
   char * file_name;
   size_t file_size;
   unsigned allocation_type;
@@ -123,7 +127,7 @@ char * map_file_to_gpu() {
       break;
   }
 
-  if (global.advise) { //TODO add a flag for memadvise
+  if (global.advise) {
     assert(global.allocation_type != _MALLOC);
     // #define cudaCpuDeviceId ((int)-1)
 
@@ -136,65 +140,61 @@ char * map_file_to_gpu() {
     //printf("Advise %d:id:%d\n", global.advise, dev_id);
     CUDA_CALL(cudaMemAdvise(shared_mem, global.file_size,
                             global.advise, dev_id));
-    //void * tmp = NULL;
-    //CUDA_CALL(cudaMalloc(&tmp, 4));
-    //CUDA_CALL(cudaMallocManaged(&tmp, 4096, cudaMemAttachGlobal));
-    //CUDA_CALL(cudaMemAdvise(shared_mem, 4096, cudaMemAdviseSetReadMostly, dev_id));
   }
 
   return shared_mem;
 }
 
 /* Run a memory access benchmark on a memory mapped file
- * bufffer        - memory to access
- * rand_state_arr - random number generators
- * total_threads  - total number of threads running kernel
- * size           - size of buffer
- * granularity    - how much each thread will access
- * random_access  - if readers access randomly 
- * readers        - designates threads read data from buffer
- * writers        - designates threads write data to buffer
- *
- * XXX For simiplicity make size an even multiple of total_threads
+ * buffer           - memory backed file to access
+ * page_seq         - array of ints representing page number sequence to access
+ * rand_state_arr   - random number generators
+ * total_threads    - total number of threads running kernel
+ * pages_pre_thread - number of pages for each thread
+ * PG_SIZE          - size of a page
+ * granularity      - how much each thread will access
+ * random_access    - if readers access randomly 
+ * readers          - designates threads read data from buffer
+ * writers          - designates threads write data to buffer
  */
 __global__
 void launch_bench(char * buffer,
-                  curandState_t * rand_state_arr,
+                  int * page_seq,
+                  curandState_t * rand_state,
                   size_t total_threads,
-                  size_t size,
+                  size_t pages_per_thread,
+                  size_t PG_SIZE,
                   size_t granularity, 
                   bool random_access,
                   bool readers, 
                   bool writers) {
-    unsigned global_index = blockIdx.x * blockDim.x + threadIdx.x;
-    unsigned bytes_per_thread = size / total_threads;
-    unsigned min_index = bytes_per_thread * global_index;
-    unsigned max_index = min_index + bytes_per_thread - 1;
+  unsigned global_index = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned bytes_per_thread = pages_per_thread * PG_SIZE;
+  page_seq = page_seq + (pages_per_thread * global_index); // TODO verify correct
+  
 
-    curandState_t * rand_state = rand_state_arr + global_index;
-
-    //printf("id %d:%d; Index range %d:%d\n", blockIdx.x, threadIdx.x, 
-           //min_index, max_index);
+  int cur_page_num = 0;
+  char * cur_page = NULL;
 
 
-    unsigned index_offset = 0;
-    for (int i = 0; i < bytes_per_thread; i += granularity) { 
-      if (random_access) {
-        index_offset = curand(rand_state) % bytes_per_thread;
-      } else { /* Sequential */
-        index_offset = i;
-      }
-      assert(index_offset + min_index <= max_index);
 
-      volatile char tmp = 0;
-      if (readers) {
-        tmp = buffer[min_index + index_offset];
-      } 
-      
-      if (writers) {
-        buffer[min_index + index_offset] = (curand(rand_state) % 92) + 33; // valid ascii range
+  for (int i = 0; i < pages_per_thread; i++) {
+    cur_page_num = page_seq[i];
+    if (cur_page_num != -1) {
+      cur_page = buffer + (cur_page_num * PG_SIZE);
+
+      for (int j = 0; j < PG_SIZE; j += granularity) { 
+        volatile char tmp = 0;
+        if (readers) {
+          tmp = cur_page[j];
+        } 
+        
+        if (writers) {
+          cur_page[j] = (curand(rand_state) % 92) + 33; // valid ascii range
+        }
       }
     }
+  }
 }
 
 __host__
@@ -212,25 +212,43 @@ void update_file_from_gpu() {
 }
 
 /* Initialize random number generators for each thread */
+__global__
+void gpu_rand_init(curandState_t * rand_state_arr) {
+      unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+          curand_init(index, 0, 0, (rand_state_arr + index));
+}
+
+/* Setup sequence of pages for each thread to access*/
 __host__
-int * random_init() {
-  /* Setup random access sequence */
-  int num_pages = global.file_size / global.PG_SIZE;
-  // TODO round up size to be incriment of threads * blocks
-  int total_threads = global.NUM_THREADS * global.NUM_BLOCKS;
-  int padded_num_pages = num_pages + (total_threads - (num_pages % total_threads));
-  size_t rand_seq_size = sizeof(int) * padded_num_pages;
+int * page_seq_init() {
+  size_t rand_seq_size = sizeof(int) * global.PADDED_NUM_PAGES;
   int * rand_seq_arr = (int *) malloc(rand_seq_size);
 
-  // TODO populate 1,2,3,n, 0,0 thenr andomize
-  for (int i = 0; i < padded_num_pages; i++) {
-    if (i < num_pages) {
-      ;
+  printf("total thread: %d\n", global.TOTAL_THREADS);
+  printf("num pages: %d\n", global.NUM_PAGES);
+  printf("padded num pages: %d\n", global.PADDED_NUM_PAGES);
+
+  /* Populate sequence */
+  for (int i = 0; i < global.PADDED_NUM_PAGES; i++) {
+    if (i < global.NUM_PAGES) {
+      rand_seq_arr[i] = i;
+    } else {
+      rand_seq_arr[i] = -1;
     }
-    ;
   }
 
-  int ** dev_rand_seq_arr = NULL;
+  /* Randomize if necessary */
+  if (global.random) {
+    for (int i = 0; i < global.PADDED_NUM_PAGES - 1; i++) 
+    {
+      int j = i + rand() / (RAND_MAX / (global.PADDED_NUM_PAGES - i) + 1);
+      int tmp = rand_seq_arr[j];
+      rand_seq_arr[j] = rand_seq_arr[i];
+      rand_seq_arr[i] = tmp;
+    }
+  }
+
+  int * dev_rand_seq_arr = NULL;
   CUDA_CALL(cudaMalloc(&dev_rand_seq_arr, rand_seq_size));
   CUDA_CALL(cudaMemcpy(dev_rand_seq_arr, rand_seq_arr, 
                        rand_seq_size, cudaMemcpyHostToDevice));
@@ -238,56 +256,49 @@ int * random_init() {
   return dev_rand_seq_arr;
 }
 
-/* Usage ./gpu_fs.o file_size blocks threads allocation_type read write random 
-   blocks - blocks to run
-   threads - threads per block
-   file_name - name of file to map
-   file_size - size of file mapping, should be multiple of PG_SIZE
-   allocation_type - 0 = mmap, 1 = cudaMalloc, 2 = cudaMallocManaged
-   read = read data?
-   write = write data?
-   random = random access?
-   */
+/* Usage ./gpu_fs.o UNUSED UNUSED <file_name> <file_size> <allocation_type>
+                    <read> <write> <random> <cudaMemoryAdvise> <dev_id> <madvise> */
 int main(int argc, char ** argv) {
   assert(argc == 12);
 
+
   /* Parse args */
-  global = {
-    .PG_SIZE =         (long) sysconf(_SC_PAGE_SIZE),
-    .NUM_THREADS =     1024,//(unsigned) atoi(argv[1]),
-    .NUM_BLOCKS =      32,//(unsigned) atoi(argv[2]),
-    .file_name =       (char *) argv[3],
-    .file_size =       (size_t) atoi(argv[4]),
-    .allocation_type = (unsigned) atoi(argv[5]),
-    .readers =         (bool) atoi(argv[6]),
-    .writers =         (bool) atoi(argv[7]),
-    .random =          (bool) atoi(argv[8]),
-    .file_mem =        NULL,
-    .shared_mem =      NULL,
-    .advise =          (cudaMemoryAdvise) atoi(argv[9]), //XXX 0 means no advise
-    .device =          (int) atoi(argv[10]), //XXX only matters if advise is non 0
-    .mmap_advise =     (int) atoi(argv[11]), //XXX -1 no advice
-  };
+  global.file_name        = (char *) argv[3];
+  global.file_size        = (size_t) atoi(argv[4]);
+  global.allocation_type  = (unsigned) atoi(argv[5]);
+  global.readers          = (bool) atoi(argv[6]);
+  global.writers          = (bool) atoi(argv[7]);
+  global.random           = (bool) atoi(argv[8]);
+  global.file_mem         = NULL;
+  global.shared_mem       = NULL;
+  global.advise           = (cudaMemoryAdvise) atoi(argv[9]); //XXX 0 means no advise
+  global.device           = (int) atoi(argv[10]); //XXX only matters if advise is non 0
+  global.mmap_advise      = (int) atoi(argv[11]); //XXX -1 no advice
+
+  /* Compute other handy values */
+  global.PG_SIZE = (long) sysconf(_SC_PAGE_SIZE);
+  //global.NUM_THREADS = 1024;
+  //global.NUM_BLOCKS = 32;
+  global.NUM_THREADS = 1;
+  global.NUM_BLOCKS = 2;
+  global.TOTAL_THREADS = global.NUM_THREADS * global.NUM_BLOCKS;
+  global.NUM_PAGES = global.file_size / global.PG_SIZE;
+  if (global.NUM_PAGES % global.TOTAL_THREADS == 0) {
+    global.PADDED_NUM_PAGES = global.NUM_PAGES;
+  } else {
+    global.PADDED_NUM_PAGES = global.NUM_PAGES +
+                              ((global.TOTAL_THREADS) - (global.NUM_PAGES % global.TOTAL_THREADS));
+  }
+  global.PAGES_PER_THREAD = global.PADDED_NUM_PAGES / global.TOTAL_THREADS;
+  printf("pages_pre_thread %d\n", global.PAGES_PER_THREAD);
+
   assert(global.file_size % global.PG_SIZE == 0);
-  assert(global.file_size % global.NUM_THREADS * global.NUM_BLOCKS == 0);
-
-  // DONT SHARE PAGES
-  assert(global.file_size > global.NUM_THREADS * global.NUM_BLOCKS * global.PG_SIZE == 0);
-
-
-  //int blockSize;   // The launch configurator returned block size
-  //int minGridSize; // The minimum grid size needed to achieve the
-  //                 // maximum occupancy for a full device launch
-  //int gridSize;    // The actual grid size needed, based on input size
-
-  //cudaOccupancyMaxPotentialBlockSize( &minGridSize, &blockSize,
-                                      //launch_bench, 0, 0);
+  assert(global.PADDED_NUM_PAGES % global.TOTAL_THREADS == 0);
 
 
   /* Setup file memory */
   cudaEvent_t start, end;
   float mili = 0;
-  char * shared_mem = NULL;
   CUDA_CALL(cudaEventCreate(&start));
   CUDA_CALL(cudaEventCreate(&end));
 
@@ -297,8 +308,15 @@ int main(int argc, char ** argv) {
   CUDA_CALL(cudaEventSynchronize(end));
   CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
   printf("Memory init time: %f\n", mili);
+  
+  /* Setup random number generator */
+  curandState_t * rand_state_arr = NULL;
+  size_t rand_state_size = sizeof(curandState_t) * (global.NUM_BLOCKS * global.NUM_THREADS);
+  CUDA_CALL(cudaMalloc(&rand_state_arr, rand_state_size));
+  gpu_rand_init<<<global.NUM_BLOCKS, global.NUM_THREADS>>>((curandState_t *) rand_state_arr);
 
-  int * dev_rand_seq_arr = random_init();
+  /* Setup sequence of pages to access */
+  int * dev_rand_seq_arr = page_seq_init();
 
   /* Run benchmark */
   CUDA_CALL(cudaEventCreate(&start));
@@ -306,12 +324,14 @@ int main(int argc, char ** argv) {
   CUDA_CALL(cudaEventRecord(start));
   launch_bench<<<global.NUM_BLOCKS, global.NUM_THREADS>>>(global.shared_mem, 
                                             dev_rand_seq_arr,
-                                            global.NUM_BLOCKS * global.NUM_THREADS,
-                                            global.file_size, 
+                                            rand_state_arr,
+                                            global.TOTAL_THREADS,
+                                            global.PAGES_PER_THREAD,
+                                            global.PG_SIZE,
                                             1 /*granularity*/,
-                                            random,
-                                            read,
-                                            write);
+                                            global.random,
+                                            global.readers,
+                                            global.writers);
   CUDA_CALL(cudaEventRecord(end));
   CUDA_CALL(cudaEventSynchronize(end));
   CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
