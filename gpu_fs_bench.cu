@@ -212,10 +212,30 @@ void update_file_from_gpu() {
 }
 
 /* Initialize random number generators for each thread */
-__global__
-void random_init(curandState_t * rand_state_arr) {
-    unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
-    curand_init(index, 0, 0, (rand_state_arr + index));
+__host__
+int * random_init() {
+  /* Setup random access sequence */
+  int num_pages = global.file_size / global.PG_SIZE;
+  // TODO round up size to be incriment of threads * blocks
+  int total_threads = global.NUM_THREADS * global.NUM_BLOCKS;
+  int padded_num_pages = num_pages + (total_threads - (num_pages % total_threads));
+  size_t rand_seq_size = sizeof(int) * padded_num_pages;
+  int * rand_seq_arr = (int *) malloc(rand_seq_size);
+
+  // TODO populate 1,2,3,n, 0,0 thenr andomize
+  for (int i = 0; i < padded_num_pages; i++) {
+    if (i < num_pages) {
+      ;
+    }
+    ;
+  }
+
+  int ** dev_rand_seq_arr = NULL;
+  CUDA_CALL(cudaMalloc(&dev_rand_seq_arr, rand_seq_size));
+  CUDA_CALL(cudaMemcpy(dev_rand_seq_arr, rand_seq_arr, 
+                       rand_seq_size, cudaMemcpyHostToDevice));
+
+  return dev_rand_seq_arr;
 }
 
 /* Usage ./gpu_fs.o file_size blocks threads allocation_type read write random 
@@ -251,6 +271,10 @@ int main(int argc, char ** argv) {
   assert(global.file_size % global.PG_SIZE == 0);
   assert(global.file_size % global.NUM_THREADS * global.NUM_BLOCKS == 0);
 
+  // DONT SHARE PAGES
+  assert(global.file_size > global.NUM_THREADS * global.NUM_BLOCKS * global.PG_SIZE == 0);
+
+
   //int blockSize;   // The launch configurator returned block size
   //int minGridSize; // The minimum grid size needed to achieve the
   //                 // maximum occupancy for a full device launch
@@ -274,18 +298,14 @@ int main(int argc, char ** argv) {
   CUDA_CALL(cudaEventElapsedTime(&mili, start, end));
   printf("Memory init time: %f\n", mili);
 
-  /* Setup random number generator */
-  curandState_t * rand_state_arr = NULL;
-  size_t rand_state_size = sizeof(curandState_t) * (global.NUM_BLOCKS * global.NUM_THREADS);
-  CUDA_CALL(cudaMalloc(&rand_state_arr, rand_state_size));
-  random_init<<<global.NUM_BLOCKS, global.NUM_THREADS>>>((curandState_t *) rand_state_arr);
+  int * dev_rand_seq_arr = random_init();
 
   /* Run benchmark */
   CUDA_CALL(cudaEventCreate(&start));
   CUDA_CALL(cudaEventCreate(&end));
   CUDA_CALL(cudaEventRecord(start));
   launch_bench<<<global.NUM_BLOCKS, global.NUM_THREADS>>>(global.shared_mem, 
-                                            rand_state_arr,
+                                            dev_rand_seq_arr,
                                             global.NUM_BLOCKS * global.NUM_THREADS,
                                             global.file_size, 
                                             1 /*granularity*/,
